@@ -40,7 +40,6 @@ dependencies:
   path_provider: ^2.0.15       # For saving exports
   flutter_colorpicker: ^1.0.3  # For font color picker
   provider: ^6.0.5             # For state management
-  ffmpeg_kit_flutter: ^4.5.1-LTS  # Temporary fallback for testing export
   permission_handler: ^11.0.1  # For storage/gallery access
 
 dev_dependencies:
