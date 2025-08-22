@@ -2,6 +2,8 @@ package com.example.captions_app
 
 import android.graphics.*
 import android.media.*
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import androidx.annotation.NonNull
@@ -11,69 +13,66 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.nio.ByteBuffer
-import android.os.Environment   // ✅ FIXED - Required for Downloads path
+// import android.os.Environment 
 import java.util.concurrent.ConcurrentHashMap
 import java.io.ByteArrayOutputStream
 import java.io.FileOutputStream
 import java.io.IOException
 
 
-class NativeEncoderPlugin :
-    FlutterPlugin,
-    MethodChannel.MethodCallHandler,
-    EventChannel.StreamHandler {
+class NativeEncoderPlugin: FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel.StreamHandler {
 
     private lateinit var methodChannel: MethodChannel
     private lateinit var eventChannel: EventChannel
     private var events: EventChannel.EventSink? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
-    // State
-    private lateinit var extractor: MediaExtractor
+    // Media state
+    private var extractor: MediaExtractor? = null
     private var videoTrackIdx = -1
     private var audioTrackIdx = -1
-    private lateinit var decoder: MediaCodec
-    private lateinit var encoder: MediaCodec
-    private lateinit var muxer: MediaMuxer
-    private var outAudioTrack = -1
+    private var decoder: MediaCodec? = null
+    private var encoder: MediaCodec? = null
+    private var muxer: MediaMuxer? = null
     private var outVideoTrack = -1
+    private var muxerStarted = false
+
     private var outputPath: String = ""
     private var width = 0
     private var height = 0
     private var fps = 30.0
     private var keepAudio = true
 
-    // overlay bitmaps keyed by tMs (concurrent since producer/consumer threads)
-    private val pendingOverlays = ConcurrentHashMap<Long, Bitmap>()
+    // Overlay delivery (thread-safe)
+    private val pendingOverlays = ConcurrentHashMap<Long, Bitmap>()   // exact tMs
+    private var lastOverlay: Bitmap? = null
 
     override fun onAttachedToEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
         methodChannel = MethodChannel(binding.binaryMessenger, "native_encoder")
         methodChannel.setMethodCallHandler(this)
+
         eventChannel = EventChannel(binding.binaryMessenger, "native_encoder/events")
         eventChannel.setStreamHandler(this)
     }
 
-    override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+    override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         methodChannel.setMethodCallHandler(null)
         eventChannel.setStreamHandler(null)
     }
 
-    override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-        this.events = events
-    }
+    override fun onListen(args: Any?, sink: EventChannel.EventSink?) { events = sink }
+    override fun onCancel(args: Any?) { events = null }
 
-    override fun onCancel(arguments: Any?) {
-        this.events = null
-    }
-
-    override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "start" -> {
-                val input = call.argument<String>("inputVideoPath")!!
                 outputPath = call.argument<String>("outputPath")!!
+                val input = call.argument<String>("inputVideoPath")!!
                 width = call.argument<Int>("width")!!
                 height = call.argument<Int>("height")!!
                 fps = call.argument<Double>("fps") ?: 30.0
                 keepAudio = call.argument<Boolean>("keepAudio") ?: true
+
                 startEncoding(input)
                 result.success(null)
             }
@@ -83,6 +82,8 @@ class NativeEncoderPlugin :
                 val bmp = BitmapFactory.decodeByteArray(png, 0, png.size)
                 if (bmp != null) {
                     pendingOverlays[tMs] = bmp
+                    lastOverlay?.recycle()
+                    lastOverlay = bmp.copy(Bitmap.Config.ARGB_8888, false)
                 }
                 result.success(null)
             }
@@ -99,258 +100,252 @@ class NativeEncoderPlugin :
     }
 
     private fun startEncoding(inputVideo: String) {
-        // Create a subfolder inside Downloads
-        //val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val downloadsDir = File(
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-            "CaptionsApp"
-        )
-        val appFolder = File(downloadsDir, "CaptionsApp")
-        if (!appFolder.exists()) {
-            appFolder.mkdirs()
-        }
+        extractor = MediaExtractor().apply { setDataSource(inputVideo) }
 
-        // Generate a unique file name
-        val fileName = "exported_video_${System.currentTimeMillis()}.mp4"
-
-        // Set final export path
-        outputPath = File(appFolder, fileName).absolutePath
-
-        Log.d("NativeEncoder", "Saving video to: $outputPath")
-
-        extractor = MediaExtractor()
-        extractor.setDataSource(inputVideo)
-
-        for (i in 0 until extractor.trackCount) {
-            val format = extractor.getTrackFormat(i)
-            val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+        // Pick tracks
+        val ex = extractor!!
+        for (i in 0 until ex.trackCount) {
+            val fmt = ex.getTrackFormat(i)
+            val mime = fmt.getString(MediaFormat.KEY_MIME) ?: ""
             if (mime.startsWith("video/") && videoTrackIdx == -1) {
                 videoTrackIdx = i
+                if (fmt.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                    fps = fmt.getInteger(MediaFormat.KEY_FRAME_RATE).toDouble().coerceAtLeast(1.0)
+                }
             } else if (mime.startsWith("audio/") && audioTrackIdx == -1) {
                 audioTrackIdx = i
             }
         }
 
-        extractor.selectTrack(videoTrackIdx)
-        val vFormat = extractor.getTrackFormat(videoTrackIdx)
+        // Decoder (to images)
+        ex.selectTrack(videoTrackIdx)
+        val vFormat = ex.getTrackFormat(videoTrackIdx)
         val mime = vFormat.getString(MediaFormat.KEY_MIME)!!
-        decoder = MediaCodec.createDecoderByType(mime)
-        decoder.configure(vFormat, null, null, 0)
-        decoder.start()
+        decoder = MediaCodec.createDecoderByType(mime).apply {
+            configure(vFormat, /*surface*/ null, null, 0)
+            start()
+        }
 
-        val eFormat = MediaFormat.createVideoFormat("video/avc", width, height).apply {
+        // Encoder (surface input)
+        val targetMime = "video/avc"
+        val bitRate = (width * height * 2.0 * fps).toInt()  // ~2 bpp * fps baseline
+        val eFormat = MediaFormat.createVideoFormat(targetMime, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            //setInteger(MediaFormat.KEY_BIT_RATE, width * height * 5)
-            //setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            //setInteger(MediaFormat.KEY_FRAME_RATE, fps.toInt())
-            setInteger(MediaFormat.KEY_FRAME_RATE, fps.toInt())
+            setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setInteger(MediaFormat.KEY_BIT_RATE, width * height * 8) // Higher bitrate = smoother video
+            setInteger(MediaFormat.KEY_FRAME_RATE, fps.toInt().coerceAtLeast(1))
         }
-        encoder = MediaCodec.createEncoderByType("video/avc")
-        encoder.configure(eFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        val inputSurface = encoder.createInputSurface()
-        encoder.start()
+        encoder = MediaCodec.createEncoderByType(targetMime)
+        encoder!!.configure(eFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val inputSurface = encoder!!.createInputSurface()
+        encoder!!.start()
 
-        // ✅ Create CaptionsApp folder inside Downloads if not exists
-        //val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-         
-        val captionsDir = File(downloadsDir, "CaptionsApp")
-        if (!captionsDir.exists()) {
-            captionsDir.mkdirs()
-        }
-
-        outputPath = File(captionsDir, "exported_${System.currentTimeMillis()}.mp4").absolutePath
         muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-                Thread { processLoop(inputSurface) }.start()
-            }
+        muxerStarted = false
+        outVideoTrack = -1
+
+        Thread { processLoop(inputSurface) }.start()
+    }
 
 
-    private fun processLoop(inputSurface: Surface) {
-        val canvasPaint = Paint(Paint.FILTER_BITMAP_FLAG)
-        val overlayPaint = Paint().apply { isFilterBitmap = true }
+        private fun processLoop(inputSurface: Surface) {
+        val d = decoder!!
+        val ex = extractor!!
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
 
+        val decIn = d.inputBuffers
         var sawInputEOS = false
         var sawOutputEOS = false
 
         while (!sawOutputEOS) {
-            // Feed decoder
             if (!sawInputEOS) {
-                val inIndex = decoder.dequeueInputBuffer(10_000)
-                if (inIndex >= 0) {
-                    val buffer = decoder.getInputBuffer(inIndex)!!
-                    val sampleSize = extractor.readSampleData(buffer, 0)
+                val inIdx = d.dequeueInputBuffer(10000)
+                if (inIdx >= 0) {
+                    val buf = decIn[inIdx]
+                    val sampleSize = ex.readSampleData(buf, 0)
                     if (sampleSize < 0) {
-                        decoder.queueInputBuffer(
-                            inIndex, 0, 0, 0,
-                            MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                        )
+                        d.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                         sawInputEOS = true
                     } else {
-                        val ptsUs = extractor.sampleTime
-                        decoder.queueInputBuffer(inIndex, 0, sampleSize, ptsUs, 0)
-                        extractor.advance()
+                        val ptsUs = ex.sampleTime
+                        d.queueInputBuffer(inIdx, 0, sampleSize, ptsUs, 0)
+                        ex.advance()
                     }
                 }
             }
 
-            // Get decoded output
             val info = MediaCodec.BufferInfo()
-            val outIndex = decoder.dequeueOutputBuffer(info, 10_000)
-            if (outIndex >= 0) {
-                decoder.getOutputImage(outIndex)?.let { image ->
+            val outIdx = d.dequeueOutputBuffer(info, 10000)
+            if (outIdx >= 0) {
+                val image = d.getOutputImage(outIdx)
+                if (image != null) {
                     val bmp = yuv420ToBitmap(image, width, height)
                     image.close()
 
                     val tMs = info.presentationTimeUs / 1000
-                    // Ask Flutter for overlay at this timestamp
-                    //events?.success(mapOf("type" to "requestOverlay", "tMs" to tMs))
-                    // Ask Flutter for overlay at this timestamp (tMs)
-                    val payload = mapOf("type" to "requestOverlay", "tMs" to tMs)
-                    // Post to main thread before calling EventChannel
-                    android.os.Handler(android.os.Looper.getMainLooper()).post {
-                        events?.success(payload)
+                    // Ask Flutter for overlay on main thread (EventChannel requirement)
+                    mainHandler.post {
+                        events?.success(mapOf("type" to "requestOverlay", "tMs" to tMs))
                     }
 
-
-                    // Wait up to 5s for overlay delivery
-                    var overlay: Bitmap? = null
+                    // Bounded wait ~80ms for this exact tMs
                     val startWait = System.currentTimeMillis()
-                    while (overlay == null && System.currentTimeMillis() - startWait < 5000) {
+                    var overlay: Bitmap? = null
+                    while (System.currentTimeMillis() - startWait < 80) {
                         overlay = pendingOverlays.remove(tMs)
-                        if (overlay == null) Thread.sleep(2)
+                        if (overlay != null) break
+                        Thread.sleep(2)
                     }
+                    // Fallback to last overlay to keep cadence
+                    if (overlay == null) overlay = lastOverlay
 
-                    // Composite into encoder surface
-                    val canvas = inputSurface.lockCanvas(null)
+                    val c = inputSurface.lockCanvas(null)
                     val dst = Rect(0, 0, width, height)
-                    canvas.drawBitmap(bmp, null, dst, canvasPaint)
-                    overlay?.let { canvas.drawBitmap(it, null, dst, overlayPaint) }
-                    inputSurface.unlockCanvasAndPost(canvas)
+                    c.drawBitmap(bmp, null, dst, paint)
+                    overlay?.let { c.drawBitmap(it, null, dst, paint) }
+                    inputSurface.unlockCanvasAndPost(c)
 
                     bmp.recycle()
-                    overlay?.recycle()
+                    // DO NOT recycle overlay here (might be reused)
                 }
 
-                decoder.releaseOutputBuffer(outIndex, false)
-                if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                d.releaseOutputBuffer(outIdx, false)
+                if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                     sawOutputEOS = true
                 }
             }
 
-            // Drain encoder to muxer
             drainEncoder()
         }
 
         finishEncoding()
     }
 
-    private fun drainEncoder(endOfStream: Boolean = false) {
-        if (endOfStream) {
-            encoder.signalEndOfInputStream()
-        }
+        private fun drainEncoder() {
+        val e = encoder ?: return
+        val m = muxer ?: return
+        val info = MediaCodec.BufferInfo()
 
-        val bufferInfo = MediaCodec.BufferInfo()
         while (true) {
-            val outputBufferIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
-
-            when {
-                outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                    if (!endOfStream) break
+            val outIdx = e.dequeueOutputBuffer(info, 0)
+            if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER) break
+            if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                if (muxerStarted) continue
+                outVideoTrack = m.addTrack(e.outputFormat)
+                m.start()
+                muxerStarted = true
+            } else if (outIdx >= 0) {
+                val encoded = e.getOutputBuffer(outIdx)!!
+                if (info.size > 0 && muxerStarted && outVideoTrack >= 0) {
+                    encoded.position(info.offset)
+                    encoded.limit(info.offset + info.size)
+                    m.writeSampleData(outVideoTrack, encoded, info)
                 }
-
-                outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    if (outVideoTrack != -1) {
-                        throw RuntimeException("Format changed twice!")
-                    }
-                    outVideoTrack = muxer.addTrack(encoder.outputFormat)
-
-                    // Add audio track if needed
-                    if (keepAudio && audioTrackIdx >= 0) {
-                        extractor.selectTrack(audioTrackIdx)
-                        outAudioTrack = muxer.addTrack(extractor.getTrackFormat(audioTrackIdx))
-                    }
-
-                    muxer.start()
-                }
-
-                outputBufferIndex >= 0 -> {
-                    val encodedData = encoder.getOutputBuffer(outputBufferIndex)
-                        ?: throw RuntimeException("Encoder output buffer $outputBufferIndex was null")
-
-                    if (bufferInfo.size > 0 && outVideoTrack != -1) {
-                        encodedData.position(bufferInfo.offset)
-                        encodedData.limit(bufferInfo.offset + bufferInfo.size)
-                        muxer.writeSampleData(outVideoTrack, encodedData, bufferInfo)
-                    }
-
-                    encoder.releaseOutputBuffer(outputBufferIndex, false)
-
-                    if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                        break
-                    }
-                }
+                e.releaseOutputBuffer(outIdx, false)
+                if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
             }
         }
     }
 
     private fun finishEncoding() {
-        try {
-            encoder.signalEndOfInputStream()
-        } catch (_: Throwable) {}
-
         try { drainEncoder() } catch (_: Throwable) {}
-        try { encoder.stop(); encoder.release() } catch (_: Throwable) {}
-        try { decoder.stop(); decoder.release() } catch (_: Throwable) {}
-        try { muxer.stop(); muxer.release() } catch (_: Throwable) {}
+        try { encoder?.signalEndOfInputStream() } catch (_: Throwable) {}
 
-        Log.d("NativeEncoder", "Encoding finished successfully.")
+        try { encoder?.stop() } catch (_: Throwable) {}
+        try { encoder?.release() } catch (_: Throwable) {}
+        encoder = null
+
+        try { decoder?.stop() } catch (_: Throwable) {}
+        try { decoder?.release() } catch (_: Throwable) {}
+        decoder = null
+
+        try {
+            if (muxerStarted) muxer?.stop()
+        } catch (_: Throwable) {}
+        try { muxer?.release() } catch (_: Throwable) {}
+        muxer = null
+
+        try { extractor?.release() } catch (_: Throwable) {}
+        extractor = null
+
+        // recycle cache
+        pendingOverlays.values.forEach { it.recycle() }
+        pendingOverlays.clear()
+        lastOverlay?.recycle()
+        lastOverlay = null
     }
 
     private fun releaseAll() {
-        try { encoder.release() } catch (_: Throwable) {}
-        try { decoder.release() } catch (_: Throwable) {}
-        try { muxer.release() } catch (_: Throwable) {}
+        try { encoder?.release() } catch (_: Throwable) {}
+        encoder = null
+        try { decoder?.release() } catch (_: Throwable) {}
+        decoder = null
+        try { muxer?.release() } catch (_: Throwable) {}
+        muxer = null
+        try { extractor?.release() } catch (_: Throwable) {}
+        extractor = null
+        pendingOverlays.clear()
+        lastOverlay?.recycle()
+        lastOverlay = null
     }
 
     // --- Utility: convert YUV_420_888 Image -> NV21 byte[] -> Bitmap (simple MVP)
-    private fun yuv420ToBitmap(image: Image, w: Int, h: Int): Bitmap {
-        try {
-            val yPlane = image.planes[0]
-            val uPlane = image.planes[1]
-            val vPlane = image.planes[2]
+        private fun yuv420ToBitmap(image: Image, w: Int, h: Int): Bitmap {
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
 
-            val yBuffer = yPlane.buffer
-            val uBuffer = uPlane.buffer
-            val vBuffer = vPlane.buffer
+        val ySize = yPlane.buffer.remaining()
+        val uSize = uPlane.buffer.remaining()
+        val vSize = vPlane.buffer.remaining()
 
-            val ySize = yBuffer.remaining()
-            val uSize = uBuffer.remaining()
-            val vSize = vBuffer.remaining()
+        val nv21 = ByteArray(w * h + (w * h) / 2)
 
-            // If buffer is inaccessible or corrupted → return blank bitmap
-            if (ySize <= 0 || uSize <= 0 || vSize <= 0) {
-                Log.e("NativeEncoder", "Empty YUV buffers, returning blank frame.")
-                return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        // Copy Y taking rowStride into account
+        var pos = 0
+        val yRowStride = yPlane.rowStride
+        val yPixelStride = yPlane.pixelStride
+        val yBuffer = yPlane.buffer
+        for (row in 0 until h) {
+            var col = 0
+            var yIdx = row * yRowStride
+            while (col < w) {
+                nv21[pos++] = yBuffer.get(yIdx)
+                yIdx += yPixelStride
+                col++
             }
-
-            // Copy YUV planes into NV21 format
-            val nv21 = ByteArray(ySize + uSize + vSize)
-            yBuffer.get(nv21, 0, ySize)
-            vBuffer.get(nv21, ySize, vSize)
-            uBuffer.get(nv21, ySize + vSize, uSize)
-
-            // Convert NV21 → Bitmap
-            val yuvImage = YuvImage(nv21, ImageFormat.NV21, w, h, null)
-            val out = ByteArrayOutputStream()
-            yuvImage.compressToJpeg(Rect(0, 0, w, h), 100, out)
-            val jpegBytes = out.toByteArray()
-
-            return BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-        } catch (e: Exception) {
-            Log.e("NativeEncoder", "yuv420ToBitmap failed: ${e.message}")
-            return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         }
+
+        // Interleave V and U (NV21 = Y + VU)
+        val uvRowStride = uPlane.rowStride
+        val uvPixelStride = uPlane.pixelStride
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
+
+        val chromaHeight = h / 2
+        val chromaWidth = w / 2
+
+        var offset = w * h
+        for (row in 0 until chromaHeight) {
+            var col = 0
+            var uIdx = row * uvRowStride
+            var vIdx = row * vPlane.rowStride
+            while (col < chromaWidth) {
+                val vVal = vBuffer.get(vIdx)
+                val uVal = uBuffer.get(uIdx)
+                nv21[offset++] = vVal
+                nv21[offset++] = uVal
+                uIdx += uvPixelStride
+                vIdx += vPlane.pixelStride
+                col++
+            }
+        }
+
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, w, h, null)
+        val out = ByteArrayOutputStream()
+        yuvImage.compressToJpeg(Rect(0, 0, w, h), 100, out)
+        val jpegBytes = out.toByteArray()
+        return BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
     }
 
 

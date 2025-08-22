@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../painters/caption_painter.dart';
@@ -35,88 +36,102 @@ class _ExportScreenState extends State<ExportScreen> {
   String _status = "Preparing export...";
   String? _outputPath;
 
+  StreamSubscription? _eventSub;
+  bool _started = false;
+  bool _disposed = false;
+
   @override
   void initState() {
     super.initState();
-    _startExport();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _startExport());
+  }
+  @override
+  void dispose() {
+    _disposed = true;
+    _eventSub?.cancel();
+    super.dispose();
   }
 
-Future<void> _startExport() async {
-  // ✅ Request storage permission before starting export
-  if (!await requestStoragePermission()) {
-    setState(() {
-      _status = "Storage permission denied.";
-    });
-    return;
-  }
+ Future<void> _startExport() async {
+    if (_started) return;
+    _started = true;
 
-  // ✅ Create a dedicated folder inside Downloads
-  final Directory downloadsDir =
-      Directory("/storage/emulated/0/Download/CaptionsApp");
-
-  if (!downloadsDir.existsSync()) {
-    downloadsDir.createSync(recursive: true);
-  }
-
-  final outputPath =
-      "${downloadsDir.path}/exported_${DateTime.now().millisecondsSinceEpoch}.mp4";
-
-  // ✅ Pre-render all overlays FIRST (important for smoother video)
-  for (final subtitle in widget.subtitles) {
-    final png = await _renderFrameAt(subtitle.start.inMilliseconds);
-    await _methodChannel.invokeMethod("deliverOverlay", {
-      "tMs": subtitle.start.inMilliseconds,
-      "png": png,
-    });
-  }
-
-  // ✅ Listen to native plugin requests for overlay frames (backup)
-  _eventChannel.receiveBroadcastStream().listen((evt) async {
-    final Map<dynamic, dynamic> event = evt as Map<dynamic, dynamic>;
-
-    if (event["type"] == "requestOverlay") {
-      final int tMs = event["tMs"];
-
-      // Render overlay on-demand only if missing
-      final png = await _renderFrameAt(tMs);
-
-      // Send overlay back to native encoder
-      await _methodChannel.invokeMethod("deliverOverlay", {
-        "tMs": tMs,
-        "png": png,
-      });
+    // Permissions once
+    final ok = await requestStoragePermission();
+    if (!ok) {
+      setState(() => _status = "Storage permission denied.");
+      return;
     }
-  });
 
-  // ✅ Start encoding process on native side
-  setState(() {
-    _status = "Encoding in progress...";
-  });
+    // Output file path
+    final downloadsDir = Directory("/storage/emulated/0/Download/CaptionsApp");
+    if (!downloadsDir.existsSync()) {
+      downloadsDir.createSync(recursive: true);
+    }
+    final outputPath =
+        "${downloadsDir.path}/exported_${DateTime.now().millisecondsSinceEpoch}.mp4";
 
-  try {
-    await _methodChannel.invokeMethod("start", {
-      "inputVideoPath": widget.videoPath,
-      "outputPath": outputPath,
-      "width": widget.videoWidth,
-      "height": widget.videoHeight,
-      "fps": widget.videoFps,
-      "keepAudio": true,
+    // Event stream: single subscription
+    _eventSub = _eventChannel.receiveBroadcastStream().listen((evt) async {
+      if (_disposed) return;
+      final Map<dynamic, dynamic> event = evt as Map<dynamic, dynamic>;
+      if (event["type"] == "requestOverlay") {
+        final int tMs = event["tMs"];
+        try {
+          final png = await _renderFrameAt(tMs);
+          if (_disposed) return;
+          await _methodChannel.invokeMethod("deliverOverlay", {
+            "tMs": tMs,
+            "png": png,
+          });
+        } catch (e) {
+          // Best-effort: skip this frame
+        }
+      }
     });
 
-    setState(() {
-      _status = "Export completed!";
-      _outputPath = outputPath;
-    });
+    setState(() => _status = "Encoding in progress...");
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text("Video saved at: $outputPath")),
-    );
-  } catch (e) {
-    setState(() {
-      _status = "Export failed: $e";
-    });
+    // Optional: small prewarm to reduce early stalls (first 500ms in 33ms steps)
+    try {
+      final preStart = widget.subtitles.isNotEmpty ? widget.subtitles.first.start.inMilliseconds : 0;
+      for (int t = preStart; t < preStart + 500; t += 33) {
+        final png = await _renderFrameAt(t);
+        await _methodChannel.invokeMethod("deliverOverlay", {"tMs": t, "png": png});
+      }
+    } catch (_) {}
+
+    // Start native
+    try {
+      await _methodChannel.invokeMethod("start", {
+        "inputVideoPath": widget.videoPath,
+        "outputPath": outputPath,
+        "width": widget.videoWidth,
+        "height": widget.videoHeight,
+        "fps": widget.videoFps,
+        "keepAudio": false, // keep false for stability; add audio later
+      });
+
+      // When native finishes it will close muxer; we can call finish to clean state
+      final path = await _methodChannel.invokeMethod<String>("finish");
+      if (!_disposed) {
+        setState(() {
+          _status = "Export completed!";
+          _outputPath = path ?? outputPath;
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Video saved at: $_outputPath")),
+          );
+        }
+      }
+    } catch (e) {
+      if (!_disposed) {
+        setState(() => _status = "Export failed: $e");
+      }
+    }
   }
-}
+
 
 
   Future<Uint8List> _renderFrameAt(int tMs) async {
