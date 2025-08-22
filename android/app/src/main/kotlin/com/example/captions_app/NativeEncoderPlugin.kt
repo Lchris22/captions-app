@@ -13,6 +13,9 @@ import java.io.File
 import java.nio.ByteBuffer
 import android.os.Environment   // ✅ FIXED - Required for Downloads path
 import java.util.concurrent.ConcurrentHashMap
+import java.io.ByteArrayOutputStream
+import java.io.FileOutputStream
+import java.io.IOException
 
 
 class NativeEncoderPlugin :
@@ -312,43 +315,44 @@ class NativeEncoderPlugin :
 
     // --- Utility: convert YUV_420_888 Image -> NV21 byte[] -> Bitmap (simple MVP)
     private fun yuv420ToBitmap(image: Image, w: Int, h: Int): Bitmap {
-    try {
-        val yPlane = image.planes[0]
-        val uPlane = image.planes[1]
-        val vPlane = image.planes[2]
+        try {
+            val yPlane = image.planes[0]
+            val uPlane = image.planes[1]
+            val vPlane = image.planes[2]
 
-        val yBuffer = yPlane.buffer
-        val uBuffer = uPlane.buffer
-        val vBuffer = vPlane.buffer
+            val yBuffer = yPlane.buffer
+            val uBuffer = uPlane.buffer
+            val vBuffer = vPlane.buffer
 
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
+            val ySize = yBuffer.remaining()
+            val uSize = uBuffer.remaining()
+            val vSize = vBuffer.remaining()
 
-        // If buffer is inaccessible or corrupted → return blank bitmap
-        if (ySize <= 0 || uSize <= 0 || vSize <= 0) {
-            Log.e("NativeEncoder", "Empty YUV buffers, returning blank frame.")
+            // If buffer is inaccessible or corrupted → return blank bitmap
+            if (ySize <= 0 || uSize <= 0 || vSize <= 0) {
+                Log.e("NativeEncoder", "Empty YUV buffers, returning blank frame.")
+                return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            }
+
+            // Copy YUV planes into NV21 format
+            val nv21 = ByteArray(ySize + uSize + vSize)
+            yBuffer.get(nv21, 0, ySize)
+            vBuffer.get(nv21, ySize, vSize)
+            uBuffer.get(nv21, ySize + vSize, uSize)
+
+            // Convert NV21 → Bitmap
+            val yuvImage = YuvImage(nv21, ImageFormat.NV21, w, h, null)
+            val out = ByteArrayOutputStream()
+            yuvImage.compressToJpeg(Rect(0, 0, w, h), 100, out)
+            val jpegBytes = out.toByteArray()
+
+            return BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+        } catch (e: Exception) {
+            Log.e("NativeEncoder", "yuv420ToBitmap failed: ${e.message}")
             return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         }
-
-        // Copy YUV planes into NV21 format
-        val nv21 = ByteArray(ySize + uSize + vSize)
-        yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
-        uBuffer.get(nv21, ySize + vSize, uSize)
-
-        // Convert NV21 → Bitmap
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, w, h, null)
-        val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, w, h), 100, out)
-        val jpegBytes = out.toByteArray()
-
-        return BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-    } catch (e: Exception) {
-        Log.e("NativeEncoder", "yuv420ToBitmap failed: ${e.message}")
-        return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
     }
-}
+
 
 
 }
