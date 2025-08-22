@@ -7,7 +7,7 @@ import '../painters/caption_painter.dart';
 import '../services/srt_parser.dart';
 import 'dart:io';
 import '../utils/permissions.dart';
-
+import '../utils/storage_helper.dart'; 
 
 class ExportScreen extends StatefulWidget {
   final String videoPath;
@@ -57,9 +57,12 @@ class _ExportScreenState extends State<ExportScreen> {
     _started = true;
 
     // Permissions once
-    final ok = await requestStoragePermission();
-    if (!ok) {
-      setState(() => _status = "Storage permission denied.");
+    final hasPermission = await requestStoragePermission();
+    // openStorageSettings();
+    if (!hasPermission) {
+      setState(() {
+        _status = "Storage permission denied.";
+      });
       return;
     }
 
@@ -68,13 +71,14 @@ class _ExportScreenState extends State<ExportScreen> {
     if (!downloadsDir.existsSync()) {
       downloadsDir.createSync(recursive: true);
     }
-    final outputPath =
-        "${downloadsDir.path}/exported_${DateTime.now().millisecondsSinceEpoch}.mp4";
-
+    // final outputPath =
+    //     "${downloadsDir.path}/exported_${DateTime.now().millisecondsSinceEpoch}.mp4";
+    final outputPath = await getOutputPath();
     // Event stream: single subscription
     _eventSub = _eventChannel.receiveBroadcastStream().listen((evt) async {
       if (_disposed) return;
       final Map<dynamic, dynamic> event = evt as Map<dynamic, dynamic>;
+
       if (event["type"] == "requestOverlay") {
         final int tMs = event["tMs"];
         try {
@@ -84,11 +88,23 @@ class _ExportScreenState extends State<ExportScreen> {
             "tMs": tMs,
             "png": png,
           });
-        } catch (e) {
-          // Best-effort: skip this frame
+        } catch (_) {/* best effort */}
+      } else if (event["type"] == "done") {
+        final String? out = event["path"] as String?;
+        if (!_disposed) {
+          setState(() {
+            _status = "Export completed!";
+            _outputPath = out;
+          });
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text("Video saved at: $_outputPath")),
+            );
+          }
         }
       }
     });
+
 
     setState(() => _status = "Encoding in progress...");
 
@@ -109,23 +125,16 @@ class _ExportScreenState extends State<ExportScreen> {
         "width": widget.videoWidth,
         "height": widget.videoHeight,
         "fps": widget.videoFps,
-        "keepAudio": false, // keep false for stability; add audio later
+        "keepAudio": false, // keep false for now
       });
 
-      // When native finishes it will close muxer; we can call finish to clean state
-      final path = await _methodChannel.invokeMethod<String>("finish");
-      if (!_disposed) {
-        setState(() {
-          _status = "Export completed!";
-          _outputPath = path ?? outputPath;
-        });
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Video saved at: $_outputPath")),
-          );
-        }
-      }
+      // Do NOT call "finish" here. Wait for the "done" event.
+      setState(() => _status = "Encoding in progress...");
     } catch (e) {
+      if (!_disposed) {
+        setState(() => _status = "Export failed: $e");
+      }
+    }catch (e) {
       if (!_disposed) {
         setState(() => _status = "Export failed: $e");
       }

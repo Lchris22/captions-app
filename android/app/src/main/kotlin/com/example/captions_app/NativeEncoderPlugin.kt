@@ -161,15 +161,28 @@ class NativeEncoderPlugin: FlutterPlugin, MethodChannel.MethodCallHandler, Event
             if (!sawInputEOS) {
                 val inIdx = d.dequeueInputBuffer(10000)
                 if (inIdx >= 0) {
-                    val buf = decIn[inIdx]
-                    val sampleSize = ex.readSampleData(buf, 0)
-                    if (sampleSize < 0) {
-                        d.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                        sawInputEOS = true
+                    val buf = d.getInputBuffer(inIdx)
+                    if (buf == null) {
+                        // Extremely rare, but be safe
+                        d.queueInputBuffer(inIdx, 0, 0, 0, 0)
                     } else {
-                        val ptsUs = ex.sampleTime
-                        d.queueInputBuffer(inIdx, 0, sampleSize, ptsUs, 0)
-                        ex.advance()
+                        buf.clear()
+                        val sampleSize = try {
+                            ex.readSampleData(buf, 0)
+                        } catch (_: Throwable) {
+                            -1
+                        }
+                        if (sampleSize < 0) {
+                            d.queueInputBuffer(
+                                inIdx, 0, 0, 0,
+                                MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                            )
+                            sawInputEOS = true
+                        } else {
+                            val ptsUs = ex.sampleTime
+                            d.queueInputBuffer(inIdx, 0, sampleSize, ptsUs, 0)
+                            ex.advance()
+                        }
                     }
                 }
             }
@@ -273,6 +286,11 @@ class NativeEncoderPlugin: FlutterPlugin, MethodChannel.MethodCallHandler, Event
         pendingOverlays.clear()
         lastOverlay?.recycle()
         lastOverlay = null
+
+        // Notify Flutter on main thread that we are done
+        mainHandler.post {
+            events?.success(mapOf("type" to "done", "path" to outputPath))
+        }
     }
 
     private fun releaseAll() {
